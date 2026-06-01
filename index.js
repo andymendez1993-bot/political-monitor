@@ -1,6 +1,6 @@
 if (process.env.NODE_ENV !== 'production') require('dotenv').config();
-console.log('SUPABASE_URL:', process.env.SUPABASE_URL ? 'found' : 'MISSING');
-console.log('NODE_ENV:', process.env.NODE_ENV);
+
+const Anthropic = require('@anthropic-ai/sdk');
 const { createClient } = require('@supabase/supabase-js');
 const RSSParser = require('rss-parser');
 const axios = require('axios');
@@ -8,10 +8,7 @@ const cron = require('node-cron');
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
-const rss = new RSSParser({
-  customFields: { item: ['media:content'] },
-  xmlParserOptions: { strict: false }
-});
+const rss = new RSSParser({ xmlParserOptions: { strict: false } });
 
 function getToday() {
   const d = new Date();
@@ -39,72 +36,50 @@ function extractTags(text) {
   return keywords.filter(k => text.toLowerCase().includes(k.toLowerCase()));
 }
 
-// ── 1. INGEST TRUTH SOCIAL ──────────────────────────────────────────
 async function fetchPosts() {
   console.log('Fetching Truth Social posts...');
   try {
     const res = await axios.get('https://truthsocial.com/@realDonaldTrump.rss', {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
-        'Accept': 'application/rss+xml, application/xml, text/xml'
-      },
+      headers: { 'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36' },
       responseType: 'text',
       timeout: 15000
     });
     let xml = res.data;
-    xml = xml.replace(/\s+[a-zA-Z]+=[^"'][^\s>]*/g, '');
-    xml = xml.replace(/<([a-zA-Z][a-zA-Z0-9]*)\s+([^>]*?)>/g, (match, tag, attrs) => {
-      const fixedAttrs = attrs.replace(/(\s+[a-zA-Z:]+)(?==)/g, '$1');
-      return `<${tag} ${fixedAttrs}>`;
-    });
+    xml = xml.replace(/\s+[a-zA-Z:]+=[^"'\s>][^\s>]*/g, '');
     const feed = await rss.parseString(xml);
     let count = 0;
     for (const item of feed.items) {
       const id = item.guid || item.link;
       const content = item.contentSnippet || item.content || item.title || '';
       const { error } = await supabase.from('posts').upsert({
-        id,
-        content,
-        published_at: item.pubDate,
-        tags: extractTags(content)
+        id, content, published_at: item.pubDate, tags: extractTags(content)
       }, { onConflict: 'id' });
       if (!error) count++;
-      else console.error('Post insert error:', error.message);
     }
     console.log(`Fetched ${count} posts`);
   } catch (e) {
-    console.error('RSS fetch error:', e.message);
-    await fetchPostsFallback();
-  }
-}
-
-async function fetchPostsFallback() {
-  console.log('Trying Truth Social fallback...');
-  try {
-    const res = await axios.get('https://api.truthsocial.com/api/v1/accounts/107780257626128497/statuses', {
-      params: { limit: 20, exclude_replies: true },
-      headers: { 'User-Agent': 'Mozilla/5.0' },
-      timeout: 15000
-    });
-    const statuses = res.data || [];
-    let count = 0;
-    for (const s of statuses) {
-      const content = s.content?.replace(/<[^>]+>/g, '') || '';
-      const { error } = await supabase.from('posts').upsert({
-        id: s.id,
-        content,
-        published_at: s.created_at,
-        tags: extractTags(content)
-      }, { onConflict: 'id' });
-      if (!error) count++;
+    console.error('RSS error:', e.message);
+    try {
+      const res = await axios.get('https://api.truthsocial.com/api/v1/accounts/107780257626128497/statuses', {
+        params: { limit: 20, exclude_replies: true },
+        headers: { 'User-Agent': 'Mozilla/5.0' },
+        timeout: 15000
+      });
+      let count = 0;
+      for (const s of res.data || []) {
+        const content = s.content?.replace(/<[^>]+>/g, '') || '';
+        const { error } = await supabase.from('posts').upsert({
+          id: s.id, content, published_at: s.created_at, tags: extractTags(content)
+        }, { onConflict: 'id' });
+        if (!error) count++;
+      }
+      console.log(`Fallback fetched ${count} posts`);
+    } catch (e2) {
+      console.error('Fallback error:', e2.message);
     }
-    console.log(`Fallback fetched ${count} posts`);
-  } catch (e) {
-    console.error('Fallback error:', e.message);
   }
 }
 
-// ── 2. INGEST CONTRACTS ─────────────────────────────────────────────
 async function fetchContracts() {
   console.log('Fetching SAM.gov contracts...');
   try {
@@ -132,16 +107,13 @@ async function fetchContracts() {
         tags: extractTags(opp.title)
       }, { onConflict: 'id' });
       if (!error) count++;
-      else console.error('Contract insert error:', error.message);
     }
     console.log(`Fetched ${count} contracts`);
   } catch (e) {
-    console.error('SAM.gov fetch error:', e.message);
-    if (e.response) console.error('SAM.gov response:', JSON.stringify(e.response.data).slice(0, 300));
+    console.error('SAM.gov error:', e.message);
   }
 }
 
-// ── 3. INGEST BILLS ─────────────────────────────────────────────────
 async function fetchBills() {
   console.log('Fetching Congress.gov bills...');
   try {
@@ -169,16 +141,13 @@ async function fetchBills() {
         tags: extractTags(bill.title)
       }, { onConflict: 'id' });
       if (!error) count++;
-      else console.error('Bill insert error:', error.message);
     }
     console.log(`Fetched ${count} bills`);
   } catch (e) {
-    console.error('Congress fetch error:', e.message);
-    if (e.response) console.error('Congress response:', JSON.stringify(e.response.data).slice(0, 300));
+    console.error('Congress error:', e.message);
   }
 }
 
-// ── 4. AI CORRELATION ANALYSIS ──────────────────────────────────────
 async function analyzeCorrelations() {
   console.log('Running AI correlation analysis...');
   try {
@@ -186,7 +155,7 @@ async function analyzeCorrelations() {
     const { data: contracts } = await supabase.from('contracts').select('*').limit(20);
     const { data: bills } = await supabase.from('bills').select('*').limit(20);
 
-    if (!posts?.length) { console.log('No posts to analyze yet — will retry next run'); return; }
+    if (!posts?.length) { console.log('No posts to analyze'); return; }
 
     const prompt = `You are a political intelligence analyst. Analyze these Truth Social posts, federal contracts, and legislation for correlations.
 
@@ -199,15 +168,15 @@ ${contracts?.length ? contracts.map(c => `- [${c.id}] ${c.title} | ${c.agency} |
 BILLS:
 ${bills?.length ? bills.map(b => `- [${b.id}] ${b.number}: ${b.title} | Status: ${b.status}`).join('\n') : 'None yet'}
 
-Find the top 5 correlations between posts and contracts/bills. Return ONLY a valid JSON array:
+Find the top 5 correlations. Return ONLY a valid JSON array with no markdown:
 [{
-  "post_id": "the post id",
+  "post_id": "post id",
   "contract_id": "contract id or null",
   "bill_id": "bill id or null",
   "score": 0-100,
   "summary": "2-3 sentence explanation",
   "level": "high or medium or low",
-  "companies": [{"name": "Company Name", "ticker": "TICKER or null", "industry": "industry sector"}]
+  "companies": [{"name": "Company Name", "ticker": "TICKER or null", "industry": "sector"}]
 }]`;
 
     const message = await anthropic.messages.create({
@@ -229,7 +198,7 @@ Find the top 5 correlations between posts and contracts/bills. Return ONLY a val
         level: corr.level
       }).select().single();
 
-      if (error) { console.error('Correlation insert error:', error.message); continue; }
+      if (error) { console.error('Correlation error:', error.message); continue; }
 
       if (corr.companies?.length && corrData) {
         for (const co of corr.companies) {
@@ -249,7 +218,6 @@ Find the top 5 correlations between posts and contracts/bills. Return ONLY a val
   }
 }
 
-// ── MAIN PIPELINE ────────────────────────────────────────────────────
 async function runPipeline() {
   console.log('\n========== PIPELINE START', new Date().toISOString(), '==========');
   await fetchPosts();
