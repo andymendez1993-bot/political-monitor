@@ -1,5 +1,6 @@
 if (process.env.NODE_ENV !== 'production') require('dotenv').config();
-const Anthropic = require('@anthropic-ai/sdk');
+console.log('SUPABASE_URL:', process.env.SUPABASE_URL ? 'found' : 'MISSING');
+console.log('NODE_ENV:', process.env.NODE_ENV);
 const { createClient } = require('@supabase/supabase-js');
 const RSSParser = require('rss-parser');
 const axios = require('axios');
