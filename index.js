@@ -2,14 +2,14 @@ if (process.env.NODE_ENV !== 'production') require('dotenv').config();
 
 const Anthropic = require('@anthropic-ai/sdk');
 const { createClient } = require('@supabase/supabase-js');
+const ws = require('ws');
 const RSSParser = require('rss-parser');
 const axios = require('axios');
 const cron = require('node-cron');
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
-  realtime: { enabled: false },
-  global: { fetch: (...args) => import('node-fetch').then(({ default: fetch }) => fetch(...args)).catch(() => globalThis.fetch(...args)) }
+  realtime: { transport: ws }
 });
 const rss = new RSSParser({ xmlParserOptions: { strict: false } });
 
