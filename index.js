@@ -7,7 +7,10 @@ const axios = require('axios');
 const cron = require('node-cron');
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
+  realtime: { enabled: false },
+  global: { fetch: (...args) => import('node-fetch').then(({ default: fetch }) => fetch(...args)).catch(() => globalThis.fetch(...args)) }
+});
 const rss = new RSSParser({ xmlParserOptions: { strict: false } });
 
 function getToday() {
