@@ -324,4 +324,4 @@ async function runPipeline() {
 }
 
 runPipeline();
-cron.schedule('0 */4 * * *', runPipeline);
+cron.schedule('*/30 * * * *', runPipeline);
