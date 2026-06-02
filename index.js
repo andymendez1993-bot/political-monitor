@@ -6,8 +6,8 @@ const ws = require('ws');
 const RSSParser = require('rss-parser');
 const axios = require('axios');
 const cron = require('node-cron');
-const { YahooFinance } = require('yahoo-finance2');
-const yahooFinance = new YahooFinance();
+const yahooFinance = require('yahoo-finance2');
+
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
   realtime: { transport: ws }
@@ -40,18 +40,16 @@ function extractTags(text) {
   return keywords.filter(k => text.toLowerCase().includes(k.toLowerCase()));
 }
 
-// ── STOCK PRICE FETCH ───────────────────────────────────────────────
 async function getStockPrice(ticker) {
   try {
-    const quote = await yahooFinance.quote(ticker);
-    return quote.regularMarketPrice || null;
+    const result = await yahooFinance.quote(ticker);
+    return result.regularMarketPrice || null;
   } catch (e) {
     console.error(`Stock price error for ${ticker}:`, e.message);
     return null;
   }
 }
 
-// ── UPDATE PORTFOLIO VALUES ─────────────────────────────────────────
 async function updatePortfolioValues() {
   console.log('Updating portfolio values...');
   try {
@@ -86,7 +84,6 @@ async function updatePortfolioValues() {
   }
 }
 
-// ── TRACK NEW STOCK MENTION ─────────────────────────────────────────
 async function trackStockMention(company, ticker, correlationId) {
   if (!ticker || ticker === 'null' || ticker === 'N/A') return;
   try {
@@ -296,7 +293,6 @@ Find the top 5 correlations. Return ONLY a valid JSON array with no markdown:
             source: 'claude-analysis'
           });
 
-          // Track stock mention and simulate portfolio
           if (co.ticker && co.ticker !== 'null') {
             await trackStockMention(co.name, co.ticker, corrData.id);
           }
