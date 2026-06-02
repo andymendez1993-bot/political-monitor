@@ -6,8 +6,8 @@ const ws = require('ws');
 const RSSParser = require('rss-parser');
 const axios = require('axios');
 const cron = require('node-cron');
-const yahooFinance = require('yahoo-finance2').default;
-
+const { YahooFinance } = require('yahoo-finance2');
+const yahooFinance = new YahooFinance();
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
   realtime: { transport: ws }
