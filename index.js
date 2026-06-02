@@ -38,7 +38,9 @@ function extractTags(text) {
   const keywords = ['energy','defense','tech','pharma','agriculture','semiconductor','infrastructure','manufacturing','AI','nuclear','LNG','subsidy'];
   return keywords.filter(k => text.toLowerCase().includes(k.toLowerCase()));
 }
-
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
 async function getStockPrice(ticker) {
   try {
     console.log('FINNHUB KEY:', process.env.FINNHUB_API_KEY ? 'found' : 'MISSING');
