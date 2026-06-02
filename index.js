@@ -41,6 +41,7 @@ function extractTags(text) {
 
 async function getStockPrice(ticker) {
   try {
+    console.log('FINNHUB KEY:', process.env.FINNHUB_API_KEY ? 'found' : 'MISSING');
     const res = await axios.get('https://finnhub.io/api/v1/quote', {
       params: {
         symbol: ticker,
