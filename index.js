@@ -6,7 +6,6 @@ const ws = require('ws');
 const RSSParser = require('rss-parser');
 const axios = require('axios');
 const cron = require('node-cron');
-const yahooFinance = require('yahoo-finance2');
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
@@ -42,8 +41,16 @@ function extractTags(text) {
 
 async function getStockPrice(ticker) {
   try {
-    const result = await yahooFinance.quote(ticker);
-    return result.regularMarketPrice || null;
+    const res = await axios.get('https://finnhub.io/api/v1/quote', {
+      params: {
+        symbol: ticker,
+        token: process.env.FINNHUB_API_KEY
+      },
+      timeout: 10000
+    });
+    const price = res.data.c;
+    if (!price || price === 0) return null;
+    return price;
   } catch (e) {
     console.error(`Stock price error for ${ticker}:`, e.message);
     return null;
@@ -77,7 +84,7 @@ async function updatePortfolioValues() {
         last_updated: new Date().toISOString()
       }).eq('id', mention.id);
 
-      console.log(`${mention.ticker}: $${mention.price_at_mention} → $${currentPrice} | P&L: ${gainLoss >= 0 ? '+' : ''}$${gainLoss.toFixed(2)} (${gainLossPct.toFixed(2)}%)`);
+      console.log(`${mention.ticker}: $${Number(mention.price_at_mention).toFixed(2)} → $${currentPrice.toFixed(2)} | P&L: ${gainLoss >= 0 ? '+' : ''}$${gainLoss.toFixed(2)} (${gainLossPct.toFixed(2)}%)`);
     }
   } catch (e) {
     console.error('Portfolio update error:', e.message);
