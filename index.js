@@ -6,6 +6,7 @@ const ws = require('ws');
 const RSSParser = require('rss-parser');
 const axios = require('axios');
 const cron = require('node-cron');
+const yahooFinance = require('yahoo-finance2').default;
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
@@ -37,6 +38,88 @@ function extractTags(text) {
   if (!text) return [];
   const keywords = ['energy','defense','tech','pharma','agriculture','semiconductor','infrastructure','manufacturing','AI','nuclear','LNG','subsidy'];
   return keywords.filter(k => text.toLowerCase().includes(k.toLowerCase()));
+}
+
+// ── STOCK PRICE FETCH ───────────────────────────────────────────────
+async function getStockPrice(ticker) {
+  try {
+    const quote = await yahooFinance.quote(ticker);
+    return quote.regularMarketPrice || null;
+  } catch (e) {
+    console.error(`Stock price error for ${ticker}:`, e.message);
+    return null;
+  }
+}
+
+// ── UPDATE PORTFOLIO VALUES ─────────────────────────────────────────
+async function updatePortfolioValues() {
+  console.log('Updating portfolio values...');
+  try {
+    const { data: mentions } = await supabase
+      .from('stock_mentions')
+      .select('*')
+      .not('ticker', 'is', null);
+
+    if (!mentions?.length) { console.log('No stock mentions to update'); return; }
+
+    for (const mention of mentions) {
+      if (!mention.ticker) continue;
+      const currentPrice = await getStockPrice(mention.ticker);
+      if (!currentPrice) continue;
+
+      const currentValue = mention.shares_bought * currentPrice;
+      const gainLoss = currentValue - mention.investment_amount;
+      const gainLossPct = (gainLoss / mention.investment_amount) * 100;
+
+      await supabase.from('stock_mentions').update({
+        current_price: currentPrice,
+        current_value: currentValue,
+        gain_loss: gainLoss,
+        gain_loss_pct: gainLossPct,
+        last_updated: new Date().toISOString()
+      }).eq('id', mention.id);
+
+      console.log(`${mention.ticker}: $${mention.price_at_mention} → $${currentPrice} | P&L: ${gainLoss >= 0 ? '+' : ''}$${gainLoss.toFixed(2)} (${gainLossPct.toFixed(2)}%)`);
+    }
+  } catch (e) {
+    console.error('Portfolio update error:', e.message);
+  }
+}
+
+// ── TRACK NEW STOCK MENTION ─────────────────────────────────────────
+async function trackStockMention(company, ticker, correlationId) {
+  if (!ticker || ticker === 'null' || ticker === 'N/A') return;
+  try {
+    const price = await getStockPrice(ticker);
+    if (!price) {
+      console.log(`Could not get price for ${ticker}`);
+      return;
+    }
+    const sharesBought = 1000 / price;
+    const mentionTime = new Date();
+
+    console.log(`📈 ${company} (${ticker}) mentioned at ${mentionTime.toLocaleTimeString()}, stock price is $${price.toFixed(2)}`);
+    console.log(`   Simulating $1000 purchase: ${sharesBought.toFixed(4)} shares at $${price.toFixed(2)}`);
+
+    const { error } = await supabase.from('stock_mentions').insert({
+      company_name: company,
+      ticker,
+      mentioned_at: mentionTime.toISOString(),
+      price_at_mention: price,
+      shares_bought: sharesBought,
+      investment_amount: 1000,
+      correlation_id: correlationId,
+      current_price: price,
+      current_value: 1000,
+      gain_loss: 0,
+      gain_loss_pct: 0,
+      last_updated: mentionTime.toISOString()
+    });
+
+    if (error) console.error('Stock mention insert error:', error.message);
+  } catch (e) {
+    console.error(`Stock tracking error for ${ticker}:`, e.message);
+  }
 }
 
 async function fetchPosts() {
@@ -212,6 +295,11 @@ Find the top 5 correlations. Return ONLY a valid JSON array with no markdown:
             correlation_id: corrData.id,
             source: 'claude-analysis'
           });
+
+          // Track stock mention and simulate portfolio
+          if (co.ticker && co.ticker !== 'null') {
+            await trackStockMention(co.name, co.ticker, corrData.id);
+          }
         }
       }
     }
@@ -227,6 +315,7 @@ async function runPipeline() {
   await fetchContracts();
   await fetchBills();
   await analyzeCorrelations();
+  await updatePortfolioValues();
   console.log('========== PIPELINE COMPLETE ==========\n');
 }
 
