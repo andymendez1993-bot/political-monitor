@@ -3,7 +3,6 @@ if (process.env.NODE_ENV !== 'production') require('dotenv').config();
 const Anthropic = require('@anthropic-ai/sdk');
 const { createClient } = require('@supabase/supabase-js');
 const ws = require('ws');
-const RSSParser = require('rss-parser');
 const axios = require('axios');
 const cron = require('node-cron');
 
@@ -11,7 +10,6 @@ const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
   realtime: { transport: ws }
 });
-const rss = new RSSParser({ xmlParserOptions: { strict: false } });
 
 function getToday() {
   const d = new Date();
@@ -220,57 +218,29 @@ async function getStockData(ticker) {
   }
 }
 
-// ── 6. ANALYZE STOCK ────────────────────────────────────────────────
+// ── 6. ANALYZE SINGLE STOCK ─────────────────────────────────────────
 async function analyzeStock(ticker, companyName) {
   console.log(`Analyzing ${ticker}...`);
   try {
     const data = await getStockData(ticker);
     if (!data.current_price) { console.log(`No data for ${ticker}`); return; }
 
-    const prompt = `You are a senior equity analyst. Analyze ${ticker} (${companyName || data.company_name}) using these data points:
+    const prompt = `You are a senior equity analyst. Analyze ${ticker} (${companyName || data.company_name}).
 
-CURRENT PRICE: $${data.current_price}
-DAY CHANGE: ${data.day_change_pct?.toFixed(2)}%
-52-WEEK RANGE: $${data.week_52_low} - $${data.week_52_high}
-MARKET CAP: $${data.market_cap}M
-INDUSTRY: ${data.industry}
+PRICE: $${data.current_price} | DAY: ${data.day_change_pct?.toFixed(2)}%
+52-WEEK: $${data.week_52_low} - $${data.week_52_high}
+MARKET CAP: $${data.market_cap}M | INDUSTRY: ${data.industry}
+50-day MA: $${data.ma_50} | 200-day MA: $${data.ma_200} | Beta: ${data.beta}
+P/E: ${data.pe_ratio} | EPS: $${data.eps} | Rev Growth: ${data.revenue_growth}% | Div: ${data.dividend_yield}%
+Analysts — Strong Buy: ${data.analyst_strong_buy||0} Buy: ${data.analyst_buy||0} Hold: ${data.analyst_hold||0} Sell: ${data.analyst_sell||0}
+Target: Mean $${data.target_mean} | High $${data.target_high} | Low $${data.target_low}
 
-TECHNICALS:
-- 50-day MA: $${data.ma_50}
-- 200-day MA: $${data.ma_200}
-- Beta: ${data.beta}
-
-FUNDAMENTALS:
-- P/E ratio: ${data.pe_ratio}
-- EPS: $${data.eps}
-- Revenue growth YoY: ${data.revenue_growth}%
-- Dividend yield: ${data.dividend_yield}%
-
-ANALYST CONSENSUS:
-- Strong Buy: ${data.analyst_strong_buy || 0}
-- Buy: ${data.analyst_buy || 0}
-- Hold: ${data.analyst_hold || 0}
-- Sell: ${data.analyst_sell || 0}
-- Strong Sell: ${data.analyst_strong_sell || 0}
-- Mean target: $${data.target_mean}
-- High target: $${data.target_high}
-- Low target: $${data.target_low}
-
-Return ONLY valid JSON, no markdown:
-{
-  "signal": "STRONG BUY or BUY or HOLD or AVOID or STRONG AVOID",
-  "technical_score": 1-10,
-  "fundamental_score": 1-10,
-  "risk_score": 1-10,
-  "overall_score": 1-10,
-  "reasoning": "4-6 sentence professional analysis citing specific indicators",
-  "key_risks": "2-3 specific risks",
-  "key_catalysts": "2-3 specific upside catalysts"
-}`;
+Return ONLY valid JSON:
+{"signal":"STRONG BUY or BUY or HOLD or AVOID or STRONG AVOID","technical_score":1-10,"fundamental_score":1-10,"risk_score":1-10,"overall_score":1-10,"reasoning":"4-6 sentence analysis","key_risks":"2-3 risks","key_catalysts":"2-3 catalysts"}`;
 
     const message = await anthropic.messages.create({
       model: 'claude-sonnet-4-6',
-      max_tokens: 1500,
+      max_tokens: 800,
       messages: [{ role: 'user', content: prompt }]
     });
 
@@ -281,15 +251,12 @@ Return ONLY valid JSON, no markdown:
       ? ((data.target_mean - data.current_price) / data.current_price) * 100
       : null;
 
-    const totalAnalysts = (data.analyst_strong_buy || 0) + (data.analyst_buy || 0) + (data.analyst_hold || 0) + (data.analyst_sell || 0) + (data.analyst_strong_sell || 0);
-    const bullish = (data.analyst_strong_buy || 0) + (data.analyst_buy || 0);
+    const totalAnalysts = (data.analyst_strong_buy||0)+(data.analyst_buy||0)+(data.analyst_hold||0)+(data.analyst_sell||0)+(data.analyst_strong_sell||0);
+    const bullish = (data.analyst_strong_buy||0)+(data.analyst_buy||0);
     let consensus = 'No coverage';
     if (totalAnalysts > 0) {
-      const bullPct = (bullish / totalAnalysts) * 100;
-      if (bullPct >= 70) consensus = 'Strong Buy';
-      else if (bullPct >= 50) consensus = 'Buy';
-      else if (bullPct >= 30) consensus = 'Hold';
-      else consensus = 'Sell';
+      const pct = (bullish/totalAnalysts)*100;
+      consensus = pct >= 70 ? 'Strong Buy' : pct >= 50 ? 'Buy' : pct >= 30 ? 'Hold' : 'Sell';
     }
 
     await supabase.from('stock_analysis').insert({
@@ -325,14 +292,17 @@ Return ONLY valid JSON, no markdown:
       }
     });
 
-    console.log(`✓ ${ticker}: ${analysis.signal} (score: ${analysis.overall_score}/10, upside: ${upsidePct?.toFixed(1)}%)`);
+    console.log(`✓ ${ticker}: ${analysis.signal} (${analysis.overall_score}/10, upside: ${upsidePct?.toFixed(1)}%)`);
   } catch (e) {
     console.error(`Analysis error for ${ticker}:`, e.message);
   }
 }
 
-// ── 7. RUN STOCK ANALYSIS ───────────────────────────────────────────
+// ── 7. RUN STOCK ANALYSIS ONCE PER DAY ─────────────────────────────
 async function runStockAnalysis() {
+  const hour = new Date().getHours();
+  if (hour !== 9) { console.log('Stock analysis runs at 9am only, skipping'); return; }
+
   console.log('Running deep stock analysis...');
   const { data: mentions } = await supabase
     .from('stock_mentions')
@@ -343,17 +313,20 @@ async function runStockAnalysis() {
 
   const unique = [...new Map(mentions.map(m => [m.ticker, m])).values()];
   console.log(`Analyzing ${unique.length} unique stocks...`);
-
   for (const stock of unique) {
     await analyzeStock(stock.ticker, stock.company_name);
   }
 }
 
-// ── 8. UPDATE PORTFOLIO ─────────────────────────────────────────────
+// ── 8. UPDATE PORTFOLIO VALUES ──────────────────────────────────────
 async function updatePortfolioValues() {
   console.log('Updating portfolio values...');
   try {
-    const { data: mentions } = await supabase.from('stock_mentions').select('*').not('ticker', 'is', null);
+    const { data: mentions } = await supabase
+      .from('stock_mentions')
+      .select('*')
+      .not('ticker', 'is', null);
+
     if (!mentions?.length) { console.log('No stock mentions to update'); return; }
 
     for (const mention of mentions) {
@@ -374,26 +347,47 @@ async function updatePortfolioValues() {
   } catch (e) { console.error('Portfolio error:', e.message); }
 }
 
-// ── 9. TRACK STOCK MENTION ──────────────────────────────────────────
+// ── 9. TRACK STOCK MENTION (NO DUPLICATES) ──────────────────────────
 async function trackStockMention(company, ticker, correlationId) {
   if (!ticker || ticker === 'null' || ticker === 'N/A') return;
   try {
+    const { data: existing } = await supabase
+      .from('stock_mentions')
+      .select('*')
+      .eq('ticker', ticker)
+      .limit(1);
+
     const price = await getStockPrice(ticker);
     if (!price) return;
-    const sharesBought = 1000 / price;
     const mentionTime = new Date();
-    console.log(`📈 ${company} (${ticker}) mentioned at ${mentionTime.toLocaleTimeString()}, $${price.toFixed(2)}`);
-    await supabase.from('stock_mentions').insert({
-      company_name: company, ticker,
-      mentioned_at: mentionTime.toISOString(),
-      price_at_mention: price,
-      shares_bought: sharesBought,
-      investment_amount: 1000,
-      correlation_id: correlationId,
-      current_price: price, current_value: 1000,
-      gain_loss: 0, gain_loss_pct: 0,
-      last_updated: mentionTime.toISOString()
-    });
+
+    if (existing?.length > 0) {
+      const currentValue = existing[0].shares_bought * price;
+      const gainLoss = currentValue - existing[0].investment_amount;
+      const gainLossPct = (gainLoss / existing[0].investment_amount) * 100;
+      await supabase.from('stock_mentions').update({
+        current_price: price,
+        current_value: currentValue,
+        gain_loss: gainLoss,
+        gain_loss_pct: gainLossPct,
+        last_updated: mentionTime.toISOString()
+      }).eq('ticker', ticker);
+      console.log(`🔄 ${ticker} updated: $${price.toFixed(2)}`);
+    } else {
+      const sharesBought = 1000 / price;
+      console.log(`📈 ${company} (${ticker}) first mention at $${price.toFixed(2)}`);
+      await supabase.from('stock_mentions').insert({
+        company_name: company, ticker,
+        mentioned_at: mentionTime.toISOString(),
+        price_at_mention: price,
+        shares_bought: sharesBought,
+        investment_amount: 1000,
+        correlation_id: correlationId,
+        current_price: price, current_value: 1000,
+        gain_loss: 0, gain_loss_pct: 0,
+        last_updated: mentionTime.toISOString()
+      });
+    }
   } catch (e) { console.error(`Mention error for ${ticker}:`, e.message); }
 }
 
@@ -401,37 +395,29 @@ async function trackStockMention(company, ticker, correlationId) {
 async function analyzeCorrelations() {
   console.log('Running AI correlation analysis...');
   try {
-    const { data: posts } = await supabase.from('posts').select('*').order('published_at', { ascending: false }).limit(10);
-    const { data: contracts } = await supabase.from('contracts').select('*').limit(20);
-    const { data: bills } = await supabase.from('bills').select('*').limit(20);
+    const { data: posts } = await supabase.from('posts').select('*').order('published_at', { ascending: false }).limit(5);
+    const { data: contracts } = await supabase.from('contracts').select('*').limit(10);
+    const { data: bills } = await supabase.from('bills').select('*').limit(10);
 
     if (!posts?.length) { console.log('No posts to analyze'); return; }
 
-    const prompt = `You are a political intelligence analyst. Analyze these Truth Social posts, federal contracts, and legislation for correlations.
+    const prompt = `Political intelligence analyst. Find top 3 correlations between these Truth Social posts, contracts, and bills.
 
 POSTS:
-${posts.map(p => `- [${p.id}] ${p.published_at}: ${p.content}`).join('\n')}
+${posts.map(p => `- [${p.id}] ${p.published_at}: ${p.content?.substring(0, 150)}`).join('\n')}
 
 CONTRACTS:
-${contracts?.length ? contracts.map(c => `- [${c.id}] ${c.title} | ${c.agency} | Due: ${c.deadline}`).join('\n') : 'None'}
+${contracts?.length ? contracts.map(c => `- [${c.id}] ${c.title} | ${c.agency}`).join('\n') : 'None'}
 
 BILLS:
-${bills?.length ? bills.map(b => `- [${b.id}] ${b.number}: ${b.title} | Status: ${b.status}`).join('\n') : 'None'}
+${bills?.length ? bills.map(b => `- [${b.id}] ${b.number}: ${b.title}`).join('\n') : 'None'}
 
-Find top 5 correlations. Return ONLY valid JSON array:
-[{
-  "post_id": "post id",
-  "contract_id": "contract id or null",
-  "bill_id": "bill id or null",
-  "score": 0-100,
-  "summary": "2-3 sentence explanation",
-  "level": "high or medium or low",
-  "companies": [{"name": "Company Name", "ticker": "TICKER or null", "industry": "sector"}]
-}]`;
+Return ONLY valid JSON array:
+[{"post_id":"id","contract_id":"id or null","bill_id":"id or null","score":0-100,"summary":"2 sentence explanation","level":"high or medium or low","companies":[{"name":"Name","ticker":"TICKER or null","industry":"sector"}]}]`;
 
     const message = await anthropic.messages.create({
       model: 'claude-sonnet-4-6',
-      max_tokens: 2000,
+      max_tokens: 1000,
       messages: [{ role: 'user', content: prompt }]
     });
 
@@ -482,4 +468,4 @@ async function runPipeline() {
 }
 
 runPipeline();
-cron.schedule('*/30 * * * *', runPipeline);
+cron.schedule('0 */2 * * *', runPipeline);
