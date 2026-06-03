@@ -12,11 +12,13 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        env:
+          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
       
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '24'
           cache: 'npm'
       
       - name: Install dependencies
@@ -27,11 +29,11 @@ jobs:
           NODE_ENV: production
           SAM_API_KEY: ${{ secrets.SAM_API_KEY }}
           CONGRESS_API_KEY: ${{ secrets.CONGRESS_API_KEY }}
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
           FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
-          TRUTHSOCIAL_COOKIES_BASE64: ${{ secrets.TRUTHSOCIAL_COOKIES_BASE64 }}
+          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
         run: node index.js --single-run
         timeout-minutes: 25
