@@ -1,343 +1,252 @@
-import { useEffect, useState } from 'react';
-import { createClient } from '@supabase/supabase-js';
+if (process.env.NODE_ENV !== 'production') require('dotenv').config();
 
-const supabase = createClient(
-  process.env.NEXT_PUBLIC_SUPABASE_URL,
-  process.env.NEXT_PUBLIC_SUPABASE_KEY
-);
+const Groq = require('groq-sdk');
+const { createClient } = require('@supabase/supabase-js');
+const ws = require('ws');
+const axios = require('axios');
+const cron = require('node-cron');
 
-export default function Dashboard() {
-  const [correlations, setCorrelations] = useState([]);
-  const [companies, setCompanies] = useState([]);
-  const [contracts, setContracts] = useState([]);
-  const [bills, setBills] = useState([]);
-  const [portfolio, setPortfolio] = useState([]);
-  const [analysis, setAnalysis] = useState([]);
-  const [loading, setLoading] = useState(true);
-  const [lastUpdated, setLastUpdated] = useState(null);
-  const [activeTab, setActiveTab] = useState('correlations');
-  const [expandedAnalysis, setExpandedAnalysis] = useState(null);
+const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
+  realtime: { transport: ws }
+});
 
-  useEffect(() => {
-    fetchAll();
-    const interval = setInterval(fetchAll, 5 * 60 * 1000);
-    return () => clearInterval(interval);
-  }, []);
+function getToday() {
+  const d = new Date();
+  return String(d.getMonth()+1).padStart(2,'0')+'/'+String(d.getDate()).padStart(2,'0')+'/'+d.getFullYear();
+}
+function getDateDaysAgo(days) {
+  const d = new Date();
+  d.setDate(d.getDate()-days);
+  return String(d.getMonth()+1).padStart(2,'0')+'/'+String(d.getDate()).padStart(2,'0')+'/'+d.getFullYear();
+}
+function getISODaysAgo(days) {
+  const d = new Date();
+  d.setDate(d.getDate()-days);
+  return d.toISOString().split('T')[0];
+}
+function extractTags(text) {
+  if (!text) return [];
+  const keywords = ['energy','defense','tech','pharma','agriculture','semiconductor','infrastructure','manufacturing','AI','nuclear','LNG','subsidy','tariff','trade','military','economy','tax','healthcare','immigration','oil','gas','chip'];
+  return keywords.filter(k => text.toLowerCase().includes(k.toLowerCase()));
+}
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
 
-  async function fetchAll() {
-    const [c, co, ct, b, p, a] = await Promise.all([
-      supabase.from('correlations').select('*').order('score', { ascending: false }).limit(20),
-      supabase.from('companies').select('*').order('created_at', { ascending: false }).limit(50),
-      supabase.from('contracts').select('*').order('created_at', { ascending: false }).limit(20),
-      supabase.from('bills').select('*').order('created_at', { ascending: false }).limit(20),
-      supabase.from('stock_mentions').select('*').order('mentioned_at', { ascending: false }).limit(200),
-      supabase.from('stock_analysis').select('*').order('overall_score', { ascending: false }).limit(30),
-    ]);
-    setCorrelations(c.data || []);
-    setCompanies(co.data || []);
-    setContracts(ct.data || []);
-    setBills(b.data || []);
-    const rawPortfolio = p.data || [];
-    const uniquePortfolio = [...new Map(rawPortfolio.map(s => [s.ticker, s])).values()];
-    setPortfolio(uniquePortfolio);
-    setAnalysis(a.data || []);
-    setLastUpdated(new Date().toLocaleTimeString());
-    setLoading(false);
-  }
+async function fetchPosts() {
+  console.log('Fetching Truth Social posts...');
+  try {
+    const res = await axios.get('https://truthsocial.com/api/v1/accounts/107780257626128497/statuses', {
+      params: { limit: 20, exclude_replies: true },
+      headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json' },
+      timeout: 15000
+    });
+    let count = 0;
+    for (const p of res.data || []) {
+      const content = p.content?.replace(/<[^>]+>/g,'').trim() || '';
+      if (!content) continue;
+      const { error } = await supabase.from('posts').upsert({ id: p.id, content, published_at: p.created_at, tags: extractTags(content) }, { onConflict: 'id' });
+      if (!error) count++;
+    }
+    console.log('Fetched '+count+' Truth Social posts');
+  } catch(e) { console.error('Truth Social error:', e.message); }
+}
 
-  const isNewStock = (mentionedAt) => {
-    const hoursSince = (new Date() - new Date(mentionedAt)) / (1000 * 60 * 60);
-    return hoursSince < 24;
-  };
+async function fetchContracts() {
+  console.log('Fetching SAM.gov contracts...');
+  try {
+    const res = await axios.get('https://api.sam.gov/opportunities/v2/search', {
+      params: { api_key: process.env.SAM_API_KEY, limit: 20, postedFrom: getDateDaysAgo(30), postedTo: getToday(), ptype: 'o', active: 'Yes' },
+      timeout: 15000
+    });
+    let count = 0;
+    for (const opp of (res.data.opportunitiesData || [])) {
+      const { error } = await supabase.from('contracts').upsert({ id: opp.noticeId, title: opp.title, agency: opp.fullParentPathName || 'Unknown', value: opp.award?.amount?.toString() || 'TBD', deadline: opp.responseDeadLine ? opp.responseDeadLine.split('T')[0] : null, type: opp.typeOfSetAsideDescription || 'Open', tags: extractTags(opp.title) }, { onConflict: 'id' });
+      if (!error) count++;
+    }
+    console.log('Fetched '+count+' contracts');
+  } catch(e) { console.error('SAM.gov error:', e.message); }
+}
 
-  const levelColor = (level) => {
-    if (level === 'high') return '#E24B4A';
-    if (level === 'medium') return '#EF9F27';
-    return '#1D9E75';
-  };
+async function fetchBills() {
+  console.log('Fetching Congress.gov bills...');
+  try {
+    const res = await axios.get('https://api.congress.gov/v3/bill', {
+      params: { api_key: process.env.CONGRESS_API_KEY, limit: 20, fromDateTime: getISODaysAgo(30)+'T00:00:00Z', toDateTime: getISODaysAgo(0)+'T00:00:00Z', sort: 'updateDate+desc', format: 'json' },
+      timeout: 15000
+    });
+    let count = 0;
+    for (const bill of (res.data.bills || [])) {
+      const { error } = await supabase.from('bills').upsert({ id: bill.type+'-'+bill.number+'-'+bill.congress, title: bill.title, number: bill.type+bill.number, status: bill.latestAction?.text || 'Unknown', sponsor: bill.sponsors?.[0]?.fullName || 'Unknown', summary: bill.latestAction?.text || '', tags: extractTags(bill.title) }, { onConflict: 'id' });
+      if (!error) count++;
+    }
+    console.log('Fetched '+count+' bills');
+  } catch(e) { console.error('Congress error:', e.message); }
+}
 
-  const signalColor = (signal) => {
-    if (!signal) return '#999';
-    if (signal.includes('STRONG BUY')) return '#1D9E75';
-    if (signal.includes('BUY')) return '#2ECC71';
-    if (signal.includes('HOLD')) return '#EF9F27';
-    if (signal.includes('STRONG AVOID')) return '#C0392B';
-    if (signal.includes('AVOID')) return '#E24B4A';
-    return '#999';
-  };
+async function getStockPrice(ticker) {
+  await sleep(1200);
+  try {
+    const res = await axios.get('https://finnhub.io/api/v1/quote', { params: { symbol: ticker, token: process.env.FINNHUB_API_KEY }, timeout: 10000 });
+    return res.data.c || null;
+  } catch(e) { console.error('Price error for '+ticker+':', e.message); return null; }
+}
 
-  const signalBg = (signal) => {
-    if (!signal) return '#f5f5f5';
-    if (signal.includes('STRONG BUY')) return '#e8f8f0';
-    if (signal.includes('BUY')) return '#f0faf4';
-    if (signal.includes('HOLD')) return '#fff9ed';
-    if (signal.includes('AVOID')) return '#fff0f0';
-    return '#f5f5f5';
-  };
+async function getStockData(ticker) {
+  const data = { ticker };
+  try {
+    await sleep(1200);
+    const quote = await axios.get('https://finnhub.io/api/v1/quote', { params: { symbol: ticker, token: process.env.FINNHUB_API_KEY } });
+    data.current_price = quote.data.c;
+    data.day_change_pct = quote.data.dp;
 
-  const totalInvested = portfolio.reduce((sum, s) => sum + (s.investment_amount || 0), 0);
-  const totalValue = portfolio.reduce((sum, s) => sum + (Number(s.current_value) || 0), 0);
-  const totalGainLoss = totalValue - totalInvested;
-  const totalGainLossPct = totalInvested > 0 ? (totalGainLoss / totalInvested) * 100 : 0;
-  const newStocks = portfolio.filter(s => isNewStock(s.mentioned_at));
+    await sleep(1200);
+    const profile = await axios.get('https://finnhub.io/api/v1/stock/profile2', { params: { symbol: ticker, token: process.env.FINNHUB_API_KEY } });
+    data.company_name = profile.data.name;
+    data.market_cap = profile.data.marketCapitalization;
+    data.industry = profile.data.finnhubIndustry;
 
-  const uniqueAnalysis = analysis.reduce((acc, item) => {
-    if (!acc.find(a => a.ticker === item.ticker)) acc.push(item);
-    return acc;
-  }, []);
+    await sleep(1200);
+    const metrics = await axios.get('https://finnhub.io/api/v1/stock/metric', { params: { symbol: ticker, metric: 'all', token: process.env.FINNHUB_API_KEY } });
+    const m = metrics.data.metric || {};
+    data.pe_ratio = m.peNormalizedAnnual || m.peTTM;
+    data.eps = m.epsNormalizedAnnual;
+    data.revenue_growth = m.revenueGrowthTTMYoy;
+    data.dividend_yield = m.dividendYieldIndicatedAnnual;
+    data.ma_50 = m['50DayMovingAverage'];
+    data.ma_200 = m['200DayMovingAverage'];
+    data.week_52_high = m['52WeekHigh'];
+    data.week_52_low = m['52WeekLow'];
+    data.beta = m.beta;
 
-  return (
-    <div style={{ fontFamily: 'system-ui, sans-serif', maxWidth: 960, margin: '0 auto', padding: '20px' }}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 24 }}>
-        <div>
-          <h1 style={{ margin: 0, fontSize: 24, fontWeight: 600 }}>Political Intelligence Monitor</h1>
-          <p style={{ margin: '4px 0 0', color: '#666', fontSize: 13 }}>Truth Social · SAM.gov · Congress.gov · AI Analysis · Stock Intelligence</p>
-        </div>
-        <div style={{ fontSize: 12, color: '#999' }}>{lastUpdated ? `Updated ${lastUpdated}` : 'Loading...'}</div>
-      </div>
+    await sleep(1200);
+    const reco = await axios.get('https://finnhub.io/api/v1/stock/recommendation', { params: { symbol: ticker, token: process.env.FINNHUB_API_KEY } });
+    if (reco.data?.[0]) { const r = reco.data[0]; data.analyst_strong_buy = r.strongBuy; data.analyst_buy = r.buy; data.analyst_hold = r.hold; data.analyst_sell = r.sell; data.analyst_strong_sell = r.strongSell; }
 
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(6, 1fr)', gap: 10, marginBottom: 20 }}>
-        {[
-          { label: 'Correlations', value: correlations.length },
-          { label: 'Companies', value: companies.length },
-          { label: 'Contracts', value: contracts.length },
-          { label: 'Bills', value: bills.length },
-          { label: 'Stocks tracked', value: portfolio.length },
-          { label: '🆕 New today', value: newStocks.length, highlight: newStocks.length > 0 },
-        ].map(m => (
-          <div key={m.label} style={{ background: m.highlight ? '#fff9ed' : '#f5f5f5', borderRadius: 8, padding: '10px 14px', border: m.highlight ? '1px solid #EF9F27' : 'none' }}>
-            <div style={{ fontSize: 11, color: '#666', marginBottom: 3 }}>{m.label}</div>
-            <div style={{ fontSize: 20, fontWeight: 600, color: m.highlight ? '#EF9F27' : 'inherit' }}>{loading ? '—' : m.value}</div>
-          </div>
-        ))}
-      </div>
+    await sleep(1200);
+    const target = await axios.get('https://finnhub.io/api/v1/stock/price-target', { params: { symbol: ticker, token: process.env.FINNHUB_API_KEY } });
+    data.target_high = target.data.targetHigh;
+    data.target_low = target.data.targetLow;
+    data.target_mean = target.data.targetMean;
 
-      {!loading && portfolio.length > 0 && (
-        <div style={{ background: totalGainLoss >= 0 ? '#f0faf4' : '#fff5f5', border: `1px solid ${totalGainLoss >= 0 ? '#1D9E75' : '#E24B4A'}`, borderRadius: 10, padding: '14px 20px', marginBottom: 20, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-          <div>
-            <div style={{ fontSize: 12, color: '#666', marginBottom: 2 }}>Simulated portfolio — $1,000 per mention</div>
-            <div style={{ fontSize: 20, fontWeight: 600 }}>Invested: ${totalInvested.toLocaleString()}</div>
-          </div>
-          <div style={{ textAlign: 'right' }}>
-            <div style={{ fontSize: 12, color: '#666', marginBottom: 2 }}>Current value</div>
-            <div style={{ fontSize: 20, fontWeight: 600 }}>${totalValue.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</div>
-            <div style={{ fontSize: 14, color: totalGainLoss >= 0 ? '#1D9E75' : '#E24B4A', fontWeight: 500 }}>
-              {totalGainLoss >= 0 ? '+' : ''}${totalGainLoss.toFixed(2)} ({totalGainLossPct.toFixed(2)}%)
-            </div>
-          </div>
-        </div>
-      )}
+    return data;
+  } catch(e) { console.error('Data fetch error for '+ticker+':', e.message); return data; }
+}
 
-      <div style={{ display: 'flex', gap: 4, marginBottom: 16, flexWrap: 'wrap' }}>
-        {['correlations', 'analysis', 'portfolio', 'companies', 'contracts', 'bills'].map(tab => (
-          <button key={tab} onClick={() => setActiveTab(tab)} style={{
-            padding: '8px 14px', border: '1px solid #ddd', borderRadius: 6,
-            background: activeTab === tab ? '#000' : '#fff',
-            color: activeTab === tab ? '#fff' : '#333',
-            cursor: 'pointer', fontSize: 13, textTransform: 'capitalize',
-            position: 'relative'
-          }}>
-            {tab === 'analysis' ? '🔬 Analysis' : tab}
-            {tab === 'portfolio' && newStocks.length > 0 && (
-              <span style={{ position: 'absolute', top: -6, right: -6, background: '#EF9F27', color: 'white', borderRadius: '50%', width: 16, height: 16, fontSize: 10, display: 'flex', alignItems: 'center', justifyContent: 'center', fontWeight: 700 }}>
-                {newStocks.length}
-              </span>
-            )}
-          </button>
-        ))}
-      </div>
+async function analyzeStock(ticker, companyName) {
+  console.log('Analyzing '+ticker+'...');
+  try {
+    const data = await getStockData(ticker);
+    if (!data.current_price) { console.log('No data for '+ticker); return; }
 
-      {loading && <div style={{ textAlign: 'center', padding: 40, color: '#999' }}>Loading data...</div>}
+    const prompt = 'You are a senior equity analyst. Analyze '+ticker+' ('+( companyName || data.company_name)+').\n\nPRICE: $'+data.current_price+' | DAY: '+(data.day_change_pct?.toFixed(2))+'%\n52-WEEK: $'+data.week_52_low+' - $'+data.week_52_high+'\nMARKET CAP: $'+data.market_cap+'M | INDUSTRY: '+data.industry+'\n50-day MA: $'+data.ma_50+' | 200-day MA: $'+data.ma_200+' | Beta: '+data.beta+'\nP/E: '+data.pe_ratio+' | EPS: $'+data.eps+' | Rev Growth: '+data.revenue_growth+'% | Div: '+data.dividend_yield+'%\nAnalysts - Strong Buy: '+(data.analyst_strong_buy||0)+' Buy: '+(data.analyst_buy||0)+' Hold: '+(data.analyst_hold||0)+' Sell: '+(data.analyst_sell||0)+'\nTarget: Mean $'+data.target_mean+' | High $'+data.target_high+' | Low $'+data.target_low+'\n\nReturn ONLY valid JSON no markdown:\n{"signal":"STRONG BUY or BUY or HOLD or AVOID or STRONG AVOID","technical_score":5,"fundamental_score":5,"risk_score":5,"overall_score":5,"reasoning":"4-6 sentence analysis","key_risks":"2-3 risks","key_catalysts":"2-3 catalysts"}';
 
-      {!loading && activeTab === 'correlations' && (
-        <div>
-          {correlations.map((c, i) => (
-            <div key={i} style={{ border: '1px solid #eee', borderRadius: 8, padding: 16, marginBottom: 12, borderLeft: `4px solid ${levelColor(c.level)}` }}>
-              <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 8 }}>
-                <span style={{ fontSize: 13, fontWeight: 600, color: levelColor(c.level) }}>Score: {c.score}/100</span>
-                <span style={{ fontSize: 12, color: '#999', textTransform: 'capitalize' }}>{c.level} signal</span>
-              </div>
-              <p style={{ margin: '0 0 8px', fontSize: 14, lineHeight: 1.5 }}>{c.summary}</p>
-              <div style={{ fontSize: 11, color: '#999' }}>{new Date(c.created_at).toLocaleString()}</div>
-            </div>
-          ))}
-        </div>
-      )}
+    const completion = await groq.chat.completions.create({ model: 'llama-3.3-70b-versatile', messages: [{ role: 'user', content: prompt }], max_tokens: 800, temperature: 0.3 });
+    const raw = completion.choices[0].message.content.trim().replace(/```json\n?/g,'').replace(/```\n?/g,'').trim();
+    const analysis = JSON.parse(raw);
 
-      {!loading && activeTab === 'analysis' && (
-        <div>
-          <div style={{ background: '#fffbeb', border: '1px solid #f59e0b', borderRadius: 8, padding: '10px 14px', marginBottom: 16, fontSize: 12, color: '#92400e' }}>
-            ⚠️ For research and educational purposes only. Not financial advice. Always consult a licensed financial advisor before investing.
-          </div>
-          {uniqueAnalysis.length === 0 ? (
-            <div style={{ textAlign: 'center', padding: 40, color: '#999' }}>Analysis runs at 9am daily. Check back tomorrow!</div>
-          ) : (
-            uniqueAnalysis.map((a, i) => (
-              <div key={i} style={{ border: '1px solid #eee', borderRadius: 10, marginBottom: 12, overflow: 'hidden', background: signalBg(a.signal) }}>
-                <div style={{ padding: '14px 16px', cursor: 'pointer' }} onClick={() => setExpandedAnalysis(expandedAnalysis === i ? null : i)}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
-                    <div style={{ flex: 1 }}>
-                      <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 6, flexWrap: 'wrap' }}>
-                        <span style={{ fontWeight: 700, fontSize: 16 }}>{a.ticker}</span>
-                        <span style={{ fontSize: 13, color: '#555' }}>{a.company_name}</span>
-                        <span style={{ fontSize: 12, fontWeight: 600, padding: '2px 10px', borderRadius: 99, background: signalColor(a.signal), color: 'white' }}>{a.signal}</span>
-                      </div>
-                      <div style={{ display: 'flex', gap: 16, fontSize: 12, color: '#666', flexWrap: 'wrap' }}>
-                        <span>Price: <strong>${Number(a.current_price).toFixed(2)}</strong></span>
-                        {a.target_price && <span>Target: <strong>${Number(a.target_price).toFixed(2)}</strong></span>}
-                        {a.upside_pct && <span style={{ color: a.upside_pct > 0 ? '#1D9E75' : '#E24B4A', fontWeight: 600 }}>{a.upside_pct > 0 ? '+' : ''}{Number(a.upside_pct).toFixed(1)}% upside</span>}
-                        <span>Analyst: <strong>{a.analyst_rating}</strong></span>
-                      </div>
-                    </div>
-                    <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-                      {[{label:'Tech',val:a.technical_score},{label:'Fund',val:a.fundamental_score},{label:'Risk',val:a.risk_score},{label:'Score',val:a.overall_score}].map(s => (
-                        <div key={s.label} style={{ textAlign: 'center' }}>
-                          <div style={{ fontSize: 10, color: '#999', marginBottom: 2 }}>{s.label}</div>
-                          <div style={{ fontSize: s.label==='Score'?22:18, fontWeight: 700, color: s.label==='Risk' ? (s.val<=4?'#1D9E75':s.val<=6?'#EF9F27':'#E24B4A') : (s.val>=7?'#1D9E75':s.val>=5?'#EF9F27':'#E24B4A') }}>{s.val}/10</div>
-                        </div>
-                      ))}
-                      <span style={{ fontSize: 18, color: '#999' }}>{expandedAnalysis === i ? '▲' : '▼'}</span>
-                    </div>
-                  </div>
-                </div>
-                {expandedAnalysis === i && (
-                  <div style={{ padding: '0 16px 16px', borderTop: '1px solid #eee' }}>
-                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, margin: '12px 0' }}>
-                      <div style={{ background: 'white', borderRadius: 8, padding: '10px 14px' }}>
-                        <div style={{ fontSize: 11, fontWeight: 600, color: '#666', marginBottom: 6, textTransform: 'uppercase' }}>Technical Indicators</div>
-                        <div style={{ fontSize: 13, display: 'flex', flexDirection: 'column', gap: 4 }}>
-                          {a.ma_50 && <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: '#666' }}>50-day MA</span><strong>${Number(a.ma_50).toFixed(2)}</strong></div>}
-                          {a.ma_200 && <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: '#666' }}>200-day MA</span><strong>${Number(a.ma_200).toFixed(2)}</strong></div>}
-                          {a.indicators?.week_52_high && <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: '#666' }}>52-wk High</span><strong>${Number(a.indicators.week_52_high).toFixed(2)}</strong></div>}
-                          {a.indicators?.week_52_low && <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: '#666' }}>52-wk Low</span><strong>${Number(a.indicators.week_52_low).toFixed(2)}</strong></div>}
-                          {a.indicators?.beta && <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: '#666' }}>Beta</span><strong>{Number(a.indicators.beta).toFixed(2)}</strong></div>}
-                        </div>
-                      </div>
-                      <div style={{ background: 'white', borderRadius: 8, padding: '10px 14px' }}>
-                        <div style={{ fontSize: 11, fontWeight: 600, color: '#666', marginBottom: 6, textTransform: 'uppercase' }}>Fundamentals</div>
-                        <div style={{ fontSize: 13, display: 'flex', flexDirection: 'column', gap: 4 }}>
-                          {a.pe_ratio && <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: '#666' }}>P/E Ratio</span><strong>{Number(a.pe_ratio).toFixed(1)}x</strong></div>}
-                          {a.market_cap && <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: '#666' }}>Market Cap</span><strong>${(Number(a.market_cap)/1000).toFixed(1)}B</strong></div>}
-                          {a.indicators?.revenue_growth && <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: '#666' }}>Rev Growth</span><strong style={{ color: a.indicators.revenue_growth>0?'#1D9E75':'#E24B4A' }}>{Number(a.indicators.revenue_growth).toFixed(1)}%</strong></div>}
-                          {a.indicators?.dividend_yield && <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: '#666' }}>Dividend</span><strong>{Number(a.indicators.dividend_yield).toFixed(2)}%</strong></div>}
-                        </div>
-                      </div>
-                    </div>
-                    <div style={{ background: 'white', borderRadius: 8, padding: '10px 14px', marginBottom: 10 }}>
-                      <div style={{ fontSize: 11, fontWeight: 600, color: '#666', marginBottom: 6, textTransform: 'uppercase' }}>Analyst Consensus</div>
-                      <div style={{ display: 'flex', gap: 8, fontSize: 12, flexWrap: 'wrap' }}>
-                        {a.indicators?.analyst_strong_buy > 0 && <span style={{ background: '#1D9E75', color: 'white', padding: '2px 8px', borderRadius: 99 }}>Strong Buy: {a.indicators.analyst_strong_buy}</span>}
-                        {a.indicators?.analyst_buy > 0 && <span style={{ background: '#2ECC71', color: 'white', padding: '2px 8px', borderRadius: 99 }}>Buy: {a.indicators.analyst_buy}</span>}
-                        {a.indicators?.analyst_hold > 0 && <span style={{ background: '#EF9F27', color: 'white', padding: '2px 8px', borderRadius: 99 }}>Hold: {a.indicators.analyst_hold}</span>}
-                        {a.indicators?.analyst_sell > 0 && <span style={{ background: '#E24B4A', color: 'white', padding: '2px 8px', borderRadius: 99 }}>Sell: {a.indicators.analyst_sell}</span>}
-                      </div>
-                    </div>
-                    <div style={{ background: 'white', borderRadius: 8, padding: '10px 14px', marginBottom: 10 }}>
-                      <div style={{ fontSize: 11, fontWeight: 600, color: '#666', marginBottom: 6, textTransform: 'uppercase' }}>AI Analysis</div>
-                      <p style={{ margin: 0, fontSize: 13, lineHeight: 1.7, color: '#333' }}>{a.reasoning}</p>
-                    </div>
-                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
-                      <div style={{ background: '#fff0f0', borderRadius: 8, padding: '10px 14px' }}>
-                        <div style={{ fontSize: 11, fontWeight: 600, color: '#c0392b', marginBottom: 4, textTransform: 'uppercase' }}>Key Risks</div>
-                        <p style={{ margin: 0, fontSize: 12, lineHeight: 1.6, color: '#555' }}>{a.indicators?.key_risks}</p>
-                      </div>
-                      <div style={{ background: '#f0faf4', borderRadius: 8, padding: '10px 14px' }}>
-                        <div style={{ fontSize: 11, fontWeight: 600, color: '#1D9E75', marginBottom: 4, textTransform: 'uppercase' }}>Key Catalysts</div>
-                        <p style={{ margin: 0, fontSize: 12, lineHeight: 1.6, color: '#555' }}>{a.indicators?.key_catalysts}</p>
-                      </div>
-                    </div>
-                    <div style={{ fontSize: 11, color: '#999', marginTop: 8, textAlign: 'right' }}>Analyzed: {new Date(a.analyzed_at).toLocaleString()}</div>
-                  </div>
-                )}
-              </div>
-            ))
-          )}
-        </div>
-      )}
+    const upsidePct = data.target_mean && data.current_price ? ((data.target_mean - data.current_price) / data.current_price) * 100 : null;
+    const total = (data.analyst_strong_buy||0)+(data.analyst_buy||0)+(data.analyst_hold||0)+(data.analyst_sell||0)+(data.analyst_strong_sell||0);
+    const bull = (data.analyst_strong_buy||0)+(data.analyst_buy||0);
+    let consensus = 'No coverage';
+    if (total > 0) { const pct = (bull/total)*100; consensus = pct>=70?'Strong Buy':pct>=50?'Buy':pct>=30?'Hold':'Sell'; }
 
-      {!loading && activeTab === 'portfolio' && (
-        <div>
-          <div style={{ fontSize: 13, color: '#666', marginBottom: 12 }}>
-            Each stock flagged by AI when mentioned alongside a political post. Simulating $1,000 invested at time of mention.
-          </div>
-          {newStocks.length > 0 && (
-            <div style={{ background: '#fff9ed', border: '1px solid #EF9F27', borderRadius: 8, padding: '10px 14px', marginBottom: 16 }}>
-              <div style={{ fontSize: 12, fontWeight: 600, color: '#EF9F27', marginBottom: 8 }}>🆕 NEWLY ADDED TODAY ({newStocks.length})</div>
-              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
-                {newStocks.map((s, i) => (
-                  <span key={i} style={{ background: '#EF9F27', color: 'white', padding: '3px 10px', borderRadius: 99, fontSize: 12, fontWeight: 600 }}>
-                    {s.ticker} @ ${Number(s.price_at_mention).toFixed(2)}
-                  </span>
-                ))}
-              </div>
-            </div>
-          )}
-          {portfolio.map((s, i) => {
-            const gl = s.gain_loss || 0;
-            const glPct = s.gain_loss_pct || 0;
-            const isNew = isNewStock(s.mentioned_at);
-            return (
-              <div key={i} style={{ border: `1px solid ${isNew ? '#EF9F27' : '#eee'}`, borderRadius: 8, padding: 16, marginBottom: 10, display: 'flex', justifyContent: 'space-between', alignItems: 'center', background: isNew ? '#fffdf5' : 'white' }}>
-                <div style={{ flex: 1 }}>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
-                    <span style={{ fontWeight: 600, fontSize: 15 }}>{s.ticker}</span>
-                    {isNew && <span style={{ background: '#EF9F27', color: 'white', fontSize: 10, fontWeight: 700, padding: '1px 6px', borderRadius: 99 }}>NEW</span>}
-                    <span style={{ fontSize: 13, color: '#666' }}>{s.company_name}</span>
-                  </div>
-                  <div style={{ fontSize: 12, color: '#999' }}>Mentioned: {new Date(s.mentioned_at).toLocaleString()}</div>
-                  <div style={{ fontSize: 12, color: '#999' }}>Entry: ${Number(s.price_at_mention).toFixed(2)} · {Number(s.shares_bought).toFixed(4)} shares</div>
-                </div>
-                <div style={{ textAlign: 'right' }}>
-                  <div style={{ fontSize: 14, color: '#333', marginBottom: 2 }}>Now: ${Number(s.current_price).toFixed(2)}</div>
-                  <div style={{ fontSize: 15, fontWeight: 600, color: gl >= 0 ? '#1D9E75' : '#E24B4A' }}>{gl >= 0 ? '+' : ''}${gl.toFixed(2)}</div>
-                  <div style={{ fontSize: 12, color: gl >= 0 ? '#1D9E75' : '#E24B4A' }}>{glPct >= 0 ? '+' : ''}{glPct.toFixed(2)}%</div>
-                </div>
-              </div>
-            );
-          })}
-        </div>
-      )}
+    await supabase.from('stock_analysis').insert({ ticker, company_name: companyName || data.company_name, signal: analysis.signal, technical_score: analysis.technical_score, fundamental_score: analysis.fundamental_score, risk_score: analysis.risk_score, overall_score: analysis.overall_score, current_price: data.current_price, target_price: data.target_mean, upside_pct: upsidePct, ma_50: data.ma_50, ma_200: data.ma_200, pe_ratio: data.pe_ratio, market_cap: data.market_cap, analyst_rating: consensus, reasoning: analysis.reasoning, indicators: { key_risks: analysis.key_risks, key_catalysts: analysis.key_catalysts, day_change_pct: data.day_change_pct, week_52_high: data.week_52_high, week_52_low: data.week_52_low, revenue_growth: data.revenue_growth, dividend_yield: data.dividend_yield, beta: data.beta, analyst_strong_buy: data.analyst_strong_buy, analyst_buy: data.analyst_buy, analyst_hold: data.analyst_hold, analyst_sell: data.analyst_sell } });
+    console.log('✓ '+ticker+': '+analysis.signal+' ('+analysis.overall_score+'/10, upside: '+upsidePct?.toFixed(1)+'%)');
+  } catch(e) { console.error('Analysis error for '+ticker+':', e.message); }
+}
 
-      {!loading && activeTab === 'companies' && (
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(200px, 1fr))', gap: 10 }}>
-          {companies.map((c, i) => (
-            <div key={i} style={{ border: '1px solid #eee', borderRadius: 8, padding: 14 }}>
-              <div style={{ fontWeight: 600, fontSize: 14, marginBottom: 4 }}>{c.name}</div>
-              {c.ticker && <div style={{ fontSize: 12, color: '#1D9E75', marginBottom: 4 }}>{c.ticker}</div>}
-              <div style={{ fontSize: 12, color: '#666' }}>{c.industry}</div>
-            </div>
-          ))}
-        </div>
-      )}
+async function runStockAnalysis() {
+  console.log('Running deep stock analysis...');
+  const { data: mentions } = await supabase.from('stock_mentions').select('ticker, company_name').not('ticker','is',null);
+  if (!mentions?.length) { console.log('No stocks to analyze'); return; }
+  const unique = [...new Map(mentions.map(m => [m.ticker, m])).values()];
+  console.log('Analyzing '+unique.length+' unique stocks...');
+  for (const stock of unique) { await analyzeStock(stock.ticker, stock.company_name); }
+}
 
-      {!loading && activeTab === 'contracts' && (
-        <div>
-          {contracts.map((c, i) => (
-            <div key={i} style={{ border: '1px solid #eee', borderRadius: 8, padding: 16, marginBottom: 12 }}>
-              <div style={{ fontWeight: 600, fontSize: 14, marginBottom: 4 }}>{c.title}</div>
-              <div style={{ fontSize: 13, color: '#666', marginBottom: 4 }}>{c.agency}</div>
-              <div style={{ display: 'flex', gap: 12, fontSize: 12, color: '#999' }}>
-                <span>Value: {c.value}</span>
-                {c.deadline && <span>Due: {c.deadline}</span>}
-              </div>
-            </div>
-          ))}
-        </div>
-      )}
+async function updatePortfolioValues() {
+  console.log('Updating portfolio values...');
+  try {
+    const { data: mentions } = await supabase.from('stock_mentions').select('*').not('ticker','is',null);
+    if (!mentions?.length) { console.log('No stock mentions to update'); return; }
+    for (const mention of mentions) {
+      const currentPrice = await getStockPrice(mention.ticker);
+      if (!currentPrice) continue;
+      const currentValue = mention.shares_bought * currentPrice;
+      const gainLoss = currentValue - mention.investment_amount;
+      const gainLossPct = (gainLoss / mention.investment_amount) * 100;
+      await supabase.from('stock_mentions').update({ current_price: currentPrice, current_value: currentValue, gain_loss: gainLoss, gain_loss_pct: gainLossPct, last_updated: new Date().toISOString() }).eq('id', mention.id);
+      console.log(mention.ticker+': $'+Number(mention.price_at_mention).toFixed(2)+' -> $'+currentPrice.toFixed(2)+' | '+(gainLoss>=0?'+':'')+'$'+gainLoss.toFixed(2)+' ('+gainLossPct.toFixed(2)+'%)');
+    }
+  } catch(e) { console.error('Portfolio error:', e.message); }
+}
 
-      {!loading && activeTab === 'bills' && (
-        <div>
-          {bills.map((b, i) => (
-            <div key={i} style={{ border: '1px solid #eee', borderRadius: 8, padding: 16, marginBottom: 12 }}>
-              <div style={{ display: 'flex', gap: 8, marginBottom: 6 }}>
-                <span style={{ fontSize: 12, background: '#E6F1FB', color: '#0C447C', padding: '2px 8px', borderRadius: 99 }}>{b.number}</span>
-              </div>
-              <div style={{ fontWeight: 600, fontSize: 14, marginBottom: 4 }}>{b.title}</div>
-              <div style={{ fontSize: 13, color: '#666' }}>{b.status}</div>
-            </div>
-          ))}
-        </div>
-      )}
-    </div>
-  );
+async function trackStockMention(company, ticker, correlationId) {
+  if (!ticker || ticker === 'null' || ticker === 'N/A') return;
+  try {
+    const { data: existing } = await supabase.from('stock_mentions').select('*').eq('ticker', ticker).limit(1);
+    const price = await getStockPrice(ticker);
+    if (!price) return;
+    const mentionTime = new Date();
+    if (existing?.length > 0) {
+      const currentValue = existing[0].shares_bought * price;
+      const gainLoss = currentValue - existing[0].investment_amount;
+      const gainLossPct = (gainLoss / existing[0].investment_amount) * 100;
+      await supabase.from('stock_mentions').update({ current_price: price, current_value: currentValue, gain_loss: gainLoss, gain_loss_pct: gainLossPct, last_updated: mentionTime.toISOString() }).eq('ticker', ticker);
+      console.log('🔄 '+ticker+' updated: $'+price.toFixed(2));
+    } else {
+      const sharesBought = 1000 / price;
+      console.log('📈 '+company+' ('+ticker+') NEW first mention at $'+price.toFixed(2));
+      await supabase.from('stock_mentions').insert({ company_name: company, ticker, mentioned_at: mentionTime.toISOString(), price_at_mention: price, shares_bought: sharesBought, investment_amount: 1000, correlation_id: correlationId, current_price: price, current_value: 1000, gain_loss: 0, gain_loss_pct: 0, last_updated: mentionTime.toISOString(), is_new: true });
+    }
+  } catch(e) { console.error('Mention error for '+ticker+':', e.message); }
+}
+
+async function analyzeCorrelations() {
+  console.log('Running AI correlation analysis...');
+  try {
+    const { data: posts } = await supabase.from('posts').select('*').order('published_at', { ascending: false }).limit(5);
+    const { data: contracts } = await supabase.from('contracts').select('*').limit(10);
+    const { data: bills } = await supabase.from('bills').select('*').limit(10);
+    if (!posts?.length) { console.log('No posts to analyze'); return; }
+
+    const prompt = 'Political intelligence analyst. Find top 3 correlations between these Truth Social posts, contracts, and bills.\n\nPOSTS:\n'+posts.map(p => '- ['+p.id+'] '+p.published_at+': '+(p.content?.substring(0,150))).join('\n')+'\n\nCONTRACTS:\n'+(contracts?.length ? contracts.map(c => '- ['+c.id+'] '+c.title+' | '+c.agency).join('\n') : 'None')+'\n\nBILLS:\n'+(bills?.length ? bills.map(b => '- ['+b.id+'] '+b.number+': '+b.title).join('\n') : 'None')+'\n\nReturn ONLY valid JSON array no markdown:\n[{"post_id":"id","contract_id":"id or null","bill_id":"id or null","score":0-100,"summary":"2 sentence explanation","level":"high or medium or low","companies":[{"name":"Name","ticker":"TICKER or null","industry":"sector"}]}]';
+
+    const completion = await groq.chat.completions.create({ model: 'llama-3.3-70b-versatile', messages: [{ role: 'user', content: prompt }], max_tokens: 1000, temperature: 0.3 });
+    const raw = completion.choices[0].message.content.trim().replace(/```json\n?/g,'').replace(/```\n?/g,'').trim();
+    const result = JSON.parse(raw);
+
+    for (const corr of result) {
+      const { data: corrData, error } = await supabase.from('correlations').insert({ post_id: corr.post_id, contract_id: corr.contract_id, bill_id: corr.bill_id, score: corr.score, summary: corr.summary, level: corr.level }).select().single();
+      if (error) { console.error('Correlation error:', error.message); continue; }
+      if (corr.companies?.length && corrData) {
+        for (const co of corr.companies) {
+          await supabase.from('companies').insert({ name: co.name, ticker: co.ticker, industry: co.industry, correlation_id: corrData.id, source: 'groq-analysis' });
+          if (co.ticker && co.ticker !== 'null') await trackStockMention(co.name, co.ticker, corrData.id);
+        }
+      }
+    }
+    console.log('Created '+result.length+' correlations');
+  } catch(e) { console.error('Analysis error:', e.message); }
+}
+
+async function runPipeline() {
+  console.log('\n========== PIPELINE START '+new Date().toISOString()+' ==========');
+  const hour = new Date().getHours();
+  const isFullRun = hour === 6 || hour === 12 || hour === 18;
+  await fetchPosts();
+  if (isFullRun) { await fetchContracts(); await fetchBills(); } else { console.log('Skipping contracts/bills'); }
+  await analyzeCorrelations();
+  await updatePortfolioValues();
+  await runStockAnalysis();
+  console.log('========== PIPELINE COMPLETE ==========\n');
+}
+
+if (process.argv.includes('--single-run')) {
+  runPipeline().then(() => process.exit(0)).catch(e => { console.error(e); process.exit(1); });
+} else {
+  runPipeline();
+  cron.schedule('0 */2 * * *', runPipeline);
 }
