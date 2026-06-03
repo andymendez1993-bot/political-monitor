@@ -1,3 +1,7 @@
 .env
 .env
 node_modules
+truthsocial-cookies.json
+x-cookies.json
+*.png
+test-*.js
