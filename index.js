@@ -29,13 +29,119 @@ function getISODaysAgo(days) {
 }
 function extractTags(text) {
   if (!text) return [];
-  const keywords = ['energy','defense','tech','pharma','agriculture','semiconductor','infrastructure','manufacturing','AI','nuclear','LNG','subsidy'];
+  const keywords = ['energy','defense','tech','pharma','agriculture','semiconductor','infrastructure','manufacturing','AI','nuclear','LNG','subsidy','tariff','trade','military','economy','tax','healthcare','immigration','oil','gas','chip'];
   return keywords.filter(k => text.toLowerCase().includes(k.toLowerCase()));
 }
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+// ── 1. FETCH TRUTH SOCIAL POSTS ─────────────────────────────────────
+async function fetchPosts() {
+  console.log('Fetching Truth Social posts...');
+  try {
+    const accountId = '107780257626128497';
+    const res = await axios.get(
+      `https://truthsocial.com/api/v1/accounts/${accountId}/statuses`,
+      {
+        params: { limit: 20, exclude_replies: true },
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+          'Accept': 'application/json'
+        },
+        timeout: 15000
+      }
+    );
+    const posts = res.data || [];
+    let count = 0;
+    for (const p of posts) {
+      const content = p.content?.replace(/<[^>]+>/g, '').trim() || '';
+      if (!content) continue;
+      const { error } = await supabase.from('posts').upsert({
+        id: p.id,
+        content,
+        published_at: p.created_at,
+        tags: extractTags(content)
+      }, { onConflict: 'id' });
+      if (!error) count++;
+    }
+    console.log(`Fetched ${count} Truth Social posts`);
+  } catch (e) {
+    console.error('Truth Social error:', e.message);
+  }
+}
+
+// ── 2. FETCH CONTRACTS ──────────────────────────────────────────────
+async function fetchContracts() {
+  console.log('Fetching SAM.gov contracts...');
+  try {
+    const res = await axios.get('https://api.sam.gov/opportunities/v2/search', {
+      params: {
+        api_key: process.env.SAM_API_KEY,
+        limit: 20,
+        postedFrom: getDateDaysAgo(30),
+        postedTo: getToday(),
+        ptype: 'o',
+        active: 'Yes'
+      },
+      timeout: 15000
+    });
+    const opps = res.data.opportunitiesData || [];
+    let count = 0;
+    for (const opp of opps) {
+      const { error } = await supabase.from('contracts').upsert({
+        id: opp.noticeId,
+        title: opp.title,
+        agency: opp.fullParentPathName || 'Unknown',
+        value: opp.award?.amount?.toString() || 'TBD',
+        deadline: opp.responseDeadLine ? opp.responseDeadLine.split('T')[0] : null,
+        type: opp.typeOfSetAsideDescription || 'Open',
+        tags: extractTags(opp.title)
+      }, { onConflict: 'id' });
+      if (!error) count++;
+    }
+    console.log(`Fetched ${count} contracts`);
+  } catch (e) {
+    console.error('SAM.gov error:', e.message);
+  }
+}
+
+// ── 3. FETCH BILLS ──────────────────────────────────────────────────
+async function fetchBills() {
+  console.log('Fetching Congress.gov bills...');
+  try {
+    const res = await axios.get('https://api.congress.gov/v3/bill', {
+      params: {
+        api_key: process.env.CONGRESS_API_KEY,
+        limit: 20,
+        fromDateTime: getISODaysAgo(30) + 'T00:00:00Z',
+        toDateTime: getISODaysAgo(0) + 'T00:00:00Z',
+        sort: 'updateDate+desc',
+        format: 'json'
+      },
+      timeout: 15000
+    });
+    const bills = res.data.bills || [];
+    let count = 0;
+    for (const bill of bills) {
+      const { error } = await supabase.from('bills').upsert({
+        id: `${bill.type}-${bill.number}-${bill.congress}`,
+        title: bill.title,
+        number: `${bill.type}${bill.number}`,
+        status: bill.latestAction?.text || 'Unknown',
+        sponsor: bill.sponsors?.[0]?.fullName || 'Unknown',
+        summary: bill.latestAction?.text || '',
+        tags: extractTags(bill.title)
+      }, { onConflict: 'id' });
+      if (!error) count++;
+    }
+    console.log(`Fetched ${count} bills`);
+  } catch (e) {
+    console.error('Congress error:', e.message);
+  }
+}
+
+// ── 4. STOCK PRICE ──────────────────────────────────────────────────
 async function getStockPrice(ticker) {
   await sleep(1200);
   try {
@@ -50,6 +156,7 @@ async function getStockPrice(ticker) {
   }
 }
 
+// ── 5. STOCK DATA FOR ANALYSIS ──────────────────────────────────────
 async function getStockData(ticker) {
   const data = { ticker };
   try {
@@ -113,14 +220,12 @@ async function getStockData(ticker) {
   }
 }
 
+// ── 6. ANALYZE STOCK ────────────────────────────────────────────────
 async function analyzeStock(ticker, companyName) {
   console.log(`Analyzing ${ticker}...`);
   try {
     const data = await getStockData(ticker);
-    if (!data.current_price) {
-      console.log(`No data for ${ticker}, skipping`);
-      return;
-    }
+    if (!data.current_price) { console.log(`No data for ${ticker}`); return; }
 
     const prompt = `You are a senior equity analyst. Analyze ${ticker} (${companyName || data.company_name}) using these data points:
 
@@ -147,18 +252,18 @@ ANALYST CONSENSUS:
 - Hold: ${data.analyst_hold || 0}
 - Sell: ${data.analyst_sell || 0}
 - Strong Sell: ${data.analyst_strong_sell || 0}
-- Mean target price: $${data.target_mean}
+- Mean target: $${data.target_mean}
 - High target: $${data.target_high}
 - Low target: $${data.target_low}
 
-Provide rigorous analysis like a professional sell-side analyst. Return ONLY valid JSON, no markdown:
+Return ONLY valid JSON, no markdown:
 {
   "signal": "STRONG BUY or BUY or HOLD or AVOID or STRONG AVOID",
   "technical_score": 1-10,
   "fundamental_score": 1-10,
   "risk_score": 1-10,
   "overall_score": 1-10,
-  "reasoning": "4-6 sentence professional analysis citing specific indicators. Discuss technical setup (price vs MAs, RSI implied by 52-week range position), fundamental valuation (P/E vs peers, growth, profitability), analyst sentiment, and the political catalyst from being flagged. Be specific with numbers.",
+  "reasoning": "4-6 sentence professional analysis citing specific indicators",
   "key_risks": "2-3 specific risks",
   "key_catalysts": "2-3 specific upside catalysts"
 }`;
@@ -226,6 +331,7 @@ Provide rigorous analysis like a professional sell-side analyst. Return ONLY val
   }
 }
 
+// ── 7. RUN STOCK ANALYSIS ───────────────────────────────────────────
 async function runStockAnalysis() {
   console.log('Running deep stock analysis...');
   const { data: mentions } = await supabase
@@ -243,6 +349,7 @@ async function runStockAnalysis() {
   }
 }
 
+// ── 8. UPDATE PORTFOLIO ─────────────────────────────────────────────
 async function updatePortfolioValues() {
   console.log('Updating portfolio values...');
   try {
@@ -267,6 +374,7 @@ async function updatePortfolioValues() {
   } catch (e) { console.error('Portfolio error:', e.message); }
 }
 
+// ── 9. TRACK STOCK MENTION ──────────────────────────────────────────
 async function trackStockMention(company, ticker, correlationId) {
   if (!ticker || ticker === 'null' || ticker === 'N/A') return;
   try {
@@ -289,77 +397,14 @@ async function trackStockMention(company, ticker, correlationId) {
   } catch (e) { console.error(`Mention error for ${ticker}:`, e.message); }
 }
 
-async function fetchPosts() {
-  console.log('Fetching Truth Social posts...');
-  try {
-    const res = await axios.get('https://truthsocial.com/@realDonaldTrump.rss', {
-      headers: { 'User-Agent': 'Mozilla/5.0' }, responseType: 'text', timeout: 15000
-    });
-    let xml = res.data.replace(/\s+[a-zA-Z:]+=[^"'\s>][^\s>]*/g, '');
-    const feed = await rss.parseString(xml);
-    let count = 0;
-    for (const item of feed.items) {
-      const id = item.guid || item.link;
-      const content = item.contentSnippet || item.content || item.title || '';
-      const { error } = await supabase.from('posts').upsert({ id, content, published_at: item.pubDate, tags: extractTags(content) }, { onConflict: 'id' });
-      if (!error) count++;
-    }
-    console.log(`Fetched ${count} posts`);
-  } catch (e) { console.error('RSS error:', e.message); }
-}
-
-async function fetchContracts() {
-  console.log('Fetching SAM.gov contracts...');
-  try {
-    const res = await axios.get('https://api.sam.gov/opportunities/v2/search', {
-      params: { api_key: process.env.SAM_API_KEY, limit: 20, postedFrom: getDateDaysAgo(30), postedTo: getToday(), ptype: 'o', active: 'Yes' },
-      timeout: 15000
-    });
-    let count = 0;
-    for (const opp of (res.data.opportunitiesData || [])) {
-      const { error } = await supabase.from('contracts').upsert({
-        id: opp.noticeId, title: opp.title,
-        agency: opp.fullParentPathName || 'Unknown',
-        value: opp.award?.amount?.toString() || 'TBD',
-        deadline: opp.responseDeadLine ? opp.responseDeadLine.split('T')[0] : null,
-        type: opp.typeOfSetAsideDescription || 'Open',
-        tags: extractTags(opp.title)
-      }, { onConflict: 'id' });
-      if (!error) count++;
-    }
-    console.log(`Fetched ${count} contracts`);
-  } catch (e) { console.error('SAM.gov error:', e.message); }
-}
-
-async function fetchBills() {
-  console.log('Fetching Congress.gov bills...');
-  try {
-    const res = await axios.get('https://api.congress.gov/v3/bill', {
-      params: { api_key: process.env.CONGRESS_API_KEY, limit: 20, fromDateTime: getISODaysAgo(30) + 'T00:00:00Z', toDateTime: getISODaysAgo(0) + 'T00:00:00Z', sort: 'updateDate+desc', format: 'json' },
-      timeout: 15000
-    });
-    let count = 0;
-    for (const bill of (res.data.bills || [])) {
-      const { error } = await supabase.from('bills').upsert({
-        id: `${bill.type}-${bill.number}-${bill.congress}`,
-        title: bill.title, number: `${bill.type}${bill.number}`,
-        status: bill.latestAction?.text || 'Unknown',
-        sponsor: bill.sponsors?.[0]?.fullName || 'Unknown',
-        summary: bill.latestAction?.text || '',
-        tags: extractTags(bill.title)
-      }, { onConflict: 'id' });
-      if (!error) count++;
-    }
-    console.log(`Fetched ${count} bills`);
-  } catch (e) { console.error('Congress error:', e.message); }
-}
-
+// ── 10. AI CORRELATION ANALYSIS ─────────────────────────────────────
 async function analyzeCorrelations() {
   console.log('Running AI correlation analysis...');
   try {
     const { data: posts } = await supabase.from('posts').select('*').order('published_at', { ascending: false }).limit(10);
     const { data: contracts } = await supabase.from('contracts').select('*').limit(20);
     const { data: bills } = await supabase.from('bills').select('*').limit(20);
+
     if (!posts?.length) { console.log('No posts to analyze'); return; }
 
     const prompt = `You are a political intelligence analyst. Analyze these Truth Social posts, federal contracts, and legislation for correlations.
@@ -374,22 +419,49 @@ BILLS:
 ${bills?.length ? bills.map(b => `- [${b.id}] ${b.number}: ${b.title} | Status: ${b.status}`).join('\n') : 'None'}
 
 Find top 5 correlations. Return ONLY valid JSON array:
-[{"post_id":"id","contract_id":"id or null","bill_id":"id or null","score":0-100,"summary":"explanation","level":"high or medium or low","companies":[{"name":"Name","ticker":"TICKER or null","industry":"sector"}]}]`;
+[{
+  "post_id": "post id",
+  "contract_id": "contract id or null",
+  "bill_id": "bill id or null",
+  "score": 0-100,
+  "summary": "2-3 sentence explanation",
+  "level": "high or medium or low",
+  "companies": [{"name": "Company Name", "ticker": "TICKER or null", "industry": "sector"}]
+}]`;
 
-    const message = await anthropic.messages.create({ model: 'claude-sonnet-4-6', max_tokens: 2000, messages: [{ role: 'user', content: prompt }] });
+    const message = await anthropic.messages.create({
+      model: 'claude-sonnet-4-6',
+      max_tokens: 2000,
+      messages: [{ role: 'user', content: prompt }]
+    });
+
     const raw = message.content[0].text.trim().replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
     const result = JSON.parse(raw);
 
     for (const corr of result) {
       const { data: corrData, error } = await supabase.from('correlations').insert({
-        post_id: corr.post_id, contract_id: corr.contract_id, bill_id: corr.bill_id,
-        score: corr.score, summary: corr.summary, level: corr.level
+        post_id: corr.post_id,
+        contract_id: corr.contract_id,
+        bill_id: corr.bill_id,
+        score: corr.score,
+        summary: corr.summary,
+        level: corr.level
       }).select().single();
-      if (error) continue;
+
+      if (error) { console.error('Correlation error:', error.message); continue; }
+
       if (corr.companies?.length && corrData) {
         for (const co of corr.companies) {
-          await supabase.from('companies').insert({ name: co.name, ticker: co.ticker, industry: co.industry, correlation_id: corrData.id, source: 'claude-analysis' });
-          if (co.ticker && co.ticker !== 'null') await trackStockMention(co.name, co.ticker, corrData.id);
+          await supabase.from('companies').insert({
+            name: co.name,
+            ticker: co.ticker,
+            industry: co.industry,
+            correlation_id: corrData.id,
+            source: 'claude-analysis'
+          });
+          if (co.ticker && co.ticker !== 'null') {
+            await trackStockMention(co.name, co.ticker, corrData.id);
+          }
         }
       }
     }
@@ -397,6 +469,7 @@ Find top 5 correlations. Return ONLY valid JSON array:
   } catch (e) { console.error('Analysis error:', e.message); }
 }
 
+// ── MAIN PIPELINE ────────────────────────────────────────────────────
 async function runPipeline() {
   console.log('\n========== PIPELINE START', new Date().toISOString(), '==========');
   await fetchPosts();
