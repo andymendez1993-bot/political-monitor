@@ -37,13 +37,25 @@ function sleep(ms) {
 async function fetchPosts() {
   console.log('Fetching Truth Social posts...');
   try {
-    const res = await axios.get('https://truthsocial.com/api/v1/accounts/107780257626128497/statuses', {
-      params: { limit: 20, exclude_replies: true },
-      headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json' },
-      timeout: 15000
+    const puppeteer = require('puppeteer-extra');
+    const StealthPlugin = require('puppeteer-extra-plugin-stealth');
+    puppeteer.use(StealthPlugin());
+
+    const browser = await puppeteer.launch({
+      headless: true,
+      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || 'C:/Users/Tough Guy/.cache/puppeteer/chrome/win64-127.0.6533.119/chrome-win64/chrome-win64/chrome.exe',
+      args: ['--no-sandbox', '--disable-setuid-sandbox']
     });
+    const page = await browser.newPage();
+    await page.goto('https://truthsocial.com', { waitUntil: 'networkidle2', timeout: 30000 });
+    await new Promise(r => setTimeout(r, 3000));
+    const response = await page.goto('https://truthsocial.com/api/v1/accounts/107780257626128497/statuses?limit=20&exclude_replies=true', { waitUntil: 'networkidle2', timeout: 30000 });
+    const text = await page.evaluate(() => document.body.innerText);
+    await browser.close();
+
+    const posts = JSON.parse(text);
     let count = 0;
-    for (const p of res.data || []) {
+    for (const p of posts || []) {
       const content = p.content?.replace(/<[^>]+>/g,'').trim() || '';
       if (!content) continue;
       const { error } = await supabase.from('posts').upsert({ id: p.id, content, published_at: p.created_at, tags: extractTags(content) }, { onConflict: 'id' });
@@ -52,7 +64,6 @@ async function fetchPosts() {
     console.log('Fetched '+count+' Truth Social posts');
   } catch(e) { console.error('Truth Social error:', e.message); }
 }
-
 async function fetchContracts() {
   console.log('Fetching SAM.gov contracts...');
   try {
